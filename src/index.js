@@ -236,32 +236,87 @@ function getWeatherDescription(code) {
   return weatherCodes[code] || 'Unknown weather condition';
 }
 
+// Function to parse coordinates from text
+function parseCoordinates(text) {
+  // Remove any @mentions or other text
+  text = text.replace(/<@[^>]+>/g, '').trim();
+  
+  // Split by either space or comma, and clean up any extra spaces
+  const coords = text.split(/[,\s]+/).map(coord => coord.trim());
+  const [lat, lon] = coords.map(Number);
+
+  // Validate coordinates
+  if (isNaN(lat) || isNaN(lon) || 
+      lat < -90 || lat > 90 || 
+      lon < -180 || lon > 180) {
+    return null;
+  }
+
+  return { lat, lon };
+}
+
+// Function to create help message
+function createHelpMessage() {
+  return {
+    response_type: 'ephemeral',
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*Weather Bot Help*\n\nI can help you get weather information for any location using coordinates. Here\'s how to use me:'
+        }
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '• *Direct message me* with coordinates like: `37.7749 -122.4194` or `37.7749,-122.4194`\n• *Mention me in a channel* with coordinates\n• Use the `/weather` command with coordinates'
+        }
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: 'I\'ll provide you with:\n• Current conditions\n• 4-day forecast\n• Temperature and precipitation charts'
+        }
+      }
+    ]
+  };
+}
+
 // Handle Slack command requests
 router.post('/slack/events', async (request, env) => {
+  // Clone the request before reading the body
+  const clonedRequest = request.clone();
+  const body = await clonedRequest.text();
+  
+  try {
+    // Try parsing as JSON first (for URL verification)
+    const data = JSON.parse(body);
+    
+    // Handle URL verification
+    if (data.type === 'url_verification') {
+      return new Response(JSON.stringify({ challenge: data.challenge }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  } catch (e) {
+    // If JSON parsing fails, it's probably form data
+    console.log('Not a JSON request, proceeding with form data');
+  }
+
+  // For all other requests, verify the signature
   const verification = await verifySlackRequest(request, env);
   if (verification) return verification;
 
-  const body = await request.text();
-  const data = parseFormData(body);
+  // Parse the body for other requests
+  const formData = parseFormData(body);
   
-  // Handle URL verification
-  if (data.type === 'url_verification') {
-    return new Response(JSON.stringify({ challenge: data.challenge }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-
   // Handle command requests
-  if (data.command === '/weather') {
-    const text = data.text.trim();
-    // Split by either space or comma, and clean up any extra spaces
-    const coords = text.split(/[,\s]+/).map(coord => coord.trim());
-    const [lat, lon] = coords.map(Number);
-
-    // Validate coordinates
-    if (isNaN(lat) || isNaN(lon) || 
-        lat < -90 || lat > 90 || 
-        lon < -180 || lon > 180) {
+  if (formData.command === '/weather') {
+    const coords = parseCoordinates(formData.text);
+    if (!coords) {
       return new Response(JSON.stringify({
         response_type: 'ephemeral',
         text: 'Please provide valid latitude and longitude coordinates. Example: /weather 37.7749 -122.4194 or /weather 37.7749,-122.4194'
@@ -271,8 +326,8 @@ router.post('/slack/events', async (request, env) => {
     }
 
     try {
-      const weatherData = await getWeatherData(lat, lon);
-      const locationName = await getLocationName(lat, lon, env);
+      const weatherData = await getWeatherData(coords.lat, coords.lon);
+      const locationName = await getLocationName(coords.lat, coords.lon, env);
       
       const current = weatherData.current;
       const daily = weatherData.daily;
@@ -280,7 +335,7 @@ router.post('/slack/events', async (request, env) => {
       // Current conditions
       const elevationMeters = weatherData.elevation;
       const elevationFeet = Math.round(elevationMeters * 3.28084);
-      const currentConditions = `*Weather for ${locationName || `${lat}, ${lon}`}* (Elevation: ${elevationMeters} meters / ${elevationFeet} feet)\n\n` +
+      const currentConditions = `*Weather for ${locationName || `${coords.lat}, ${coords.lon}`}* (Elevation: ${elevationMeters} meters / ${elevationFeet} feet)\n\n` +
         `*Current Weather Conditions*\n` +
         `• Temperature: ${current.temperature_2m}°F\n` +
         `• Relative Humidity: ${current.relative_humidity_2m}%\n` +
@@ -337,7 +392,109 @@ router.post('/slack/events', async (request, env) => {
     }
   }
 
-  return new Response('Command not recognized', { status: 400 });
+  // Handle message events
+  if (formData.type === 'event_callback' && formData.event.type === 'message') {
+    const event = formData.event;
+    
+    // Ignore messages from bots to prevent loops
+    if (event.bot_id) {
+      return new Response('OK', { status: 200 });
+    }
+
+    // Check if the message is a direct message or mentions the bot
+    const isDirectMessage = event.channel_type === 'im';
+    const isMention = event.text.includes(`<@${env.SLACK_BOT_USER_ID}>`);
+    
+    if (!isDirectMessage && !isMention) {
+      return new Response('OK', { status: 200 });
+    }
+
+    // Check for help command
+    if (event.text.toLowerCase().includes('help')) {
+      return new Response(JSON.stringify(createHelpMessage()), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Parse coordinates from the message
+    const coords = parseCoordinates(event.text);
+    if (!coords) {
+      return new Response(JSON.stringify({
+        response_type: 'ephemeral',
+        text: 'Please provide valid latitude and longitude coordinates. Example: `37.7749 -122.4194` or `37.7749,-122.4194`\n\nType `help` to see all available commands.'
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    try {
+      const weatherData = await getWeatherData(coords.lat, coords.lon);
+      const locationName = await getLocationName(coords.lat, coords.lon, env);
+      
+      const current = weatherData.current;
+      const daily = weatherData.daily;
+      
+      // Current conditions
+      const elevationMeters = weatherData.elevation;
+      const elevationFeet = Math.round(elevationMeters * 3.28084);
+      const currentConditions = `*Weather for ${locationName || `${coords.lat}, ${coords.lon}`}* (Elevation: ${elevationMeters} meters / ${elevationFeet} feet)\n\n` +
+        `*Current Weather Conditions*\n` +
+        `• Temperature: ${current.temperature_2m}°F\n` +
+        `• Relative Humidity: ${current.relative_humidity_2m}%\n` +
+        `• Wind Speed: ${current.wind_speed_10m} mph\n` +
+        `• Wind Gusts: ${current.wind_gusts_10m} mph\n` +
+        `• Conditions: ${getWeatherDescription(current.weather_code)}\n`;
+
+      // Four-day forecast
+      const forecast = `\n*4-Day Forecast*\n` +
+        daily.time.slice(0, 4).map((date, i) => {
+          const day = new Date(date).toLocaleDateString('en-US', { weekday: 'long' });
+          return `${day}:\n` +
+            `• High: ${daily.temperature_2m_max[i]}°F\n` +
+            `• Low: ${daily.temperature_2m_min[i]}°F\n` +
+            `• Precipitation Chance: ${daily.precipitation_probability_max[i]}%\n` +
+            `• Max Wind Gusts: ${daily.wind_gusts_10m_max[i]} mph\n` +
+            `• Conditions: ${getWeatherDescription(daily.weather_code[i])}`;
+        }).join('\n\n');
+
+      try {
+        // Generate chart URLs
+        const tempChartUrl = createTemperatureChartUrl(daily);
+        const precipChartUrl = createPrecipitationChartUrl(daily);
+
+        const weatherInfo = currentConditions + forecast + 
+          `\n\n*Temperature Forecast*\n<${tempChartUrl}|View Temperature Chart>\n\n` +
+          `*Precipitation Forecast*\n<${precipChartUrl}|View Precipitation Chart>`;
+
+        return new Response(JSON.stringify({
+          response_type: 'in_channel',
+          text: weatherInfo
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (chartError) {
+        console.error('Error generating charts:', chartError);
+        // If chart generation fails, still return the text forecast
+        const weatherInfo = currentConditions + forecast;
+        return new Response(JSON.stringify({
+          response_type: 'in_channel',
+          text: weatherInfo
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    } catch (error) {
+      console.error('Error fetching weather data:', error);
+      return new Response(JSON.stringify({
+        response_type: 'ephemeral',
+        text: 'Sorry, I encountered an error while fetching the weather data. Please try again later.'
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  return new Response('OK', { status: 200 });
 });
 
 // Handle 404s
